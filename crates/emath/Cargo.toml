@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "emath"
 version.workspace = true
 authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]

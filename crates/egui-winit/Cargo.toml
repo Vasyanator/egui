@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "egui-winit"
 version.workspace = true
 authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]

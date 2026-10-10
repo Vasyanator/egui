@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "epaint_default_fonts"
 version.workspace = true
 authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]

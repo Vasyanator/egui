@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "egui_extras"
 version.workspace = true
 authors = [

@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "ecolor"
 version.workspace = true
 authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>", "Andreas Reich <reichandreas@gmx.de>"]

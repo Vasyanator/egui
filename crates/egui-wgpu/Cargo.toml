@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "egui-wgpu"
 version.workspace = true
 description = "Bindings for using egui natively using the wgpu library"
