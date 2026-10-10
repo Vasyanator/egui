@@ -15,5 +15,9 @@ pub(crate) mod winit_integration;
 #[cfg(feature = "glow")]
 mod glow_integration;
 
+/// Android multi-window surface rules of the glow integration (pure; host-tested).
+#[cfg(any(all(feature = "glow", target_os = "android"), test))]
+mod android_viewports;
+
 #[cfg(feature = "wgpu_no_default_features")]
 mod wgpu_integration;

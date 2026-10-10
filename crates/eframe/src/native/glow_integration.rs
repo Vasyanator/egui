@@ -4,6 +4,10 @@
 //! This is also very complex code, and not very pretty.
 //! There is a bunch of improvements we could do,
 //! like removing a bunch of `unwraps`.
+//!
+//! `ManhwaStudio` fork: on Android, secondary viewports may be separate OS windows whose EGL
+//! surfaces come and go independently (`cfg(target_os = "android")` blocks; rules in
+//! `android_viewports.rs`, overview in this directory's `MODULE_README.md`).
 
 #![expect(clippy::undocumented_unsafe_blocks)]
 #![expect(clippy::unwrap_used)]
@@ -138,6 +142,11 @@ struct Viewport {
     gl_surface: Option<glutin::surface::Surface<glutin::surface::WindowSurface>>,
     window: Option<Arc<Window>>,
     egui_winit: Option<egui_winit::State>,
+
+    /// Android: the window's surface generation `gl_surface` was built for (see
+    /// `super::android_viewports`). Meaningless while `gl_surface` is `None`.
+    #[cfg(target_os = "android")]
+    surface_generation: u64,
 }
 
 impl Viewport {
@@ -445,12 +454,18 @@ impl WinitApp for GlowWinitApp<'_> {
         if let Some(mut running) = self.running.take() {
             profiling::function_scope!();
 
-            running.integration.save(
-                running.app.as_mut(),
-                Some(&running.glutin.borrow().window(ViewportId::ROOT)),
-            );
+            // Like `save`: on Android a run can end while suspended, without a root window.
+            let window_opt = running.glutin.borrow().window_opt(ViewportId::ROOT);
+            running
+                .integration
+                .save(running.app.as_mut(), window_opt.as_deref());
             running.app.on_exit(Some(running.painter.borrow().gl()));
             running.painter.borrow_mut().destroy();
+
+            // The next `run_native` creates a surface on the same `ANativeWindow`; a surface
+            // still current here would only be destroyed lazily and keep that window connected.
+            #[cfg(target_os = "android")]
+            running.glutin.borrow_mut().release_surfaces_for_exit();
         }
     }
 
@@ -529,12 +544,23 @@ impl WinitApp for GlowWinitApp<'_> {
 
     fn window_event(
         &mut self,
-        _: &ActiveEventLoop,
+        #[cfg_attr(
+            not(target_os = "android"),
+            expect(unused_variables, reason = "only the Android surface handling needs it")
+        )]
+        event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: winit::event::WindowEvent,
     ) -> Result<EventResult> {
         if let Some(running) = &mut self.running {
-            Ok(running.on_window_event(window_id, &event))
+            Ok(cfg_select! {
+                target_os = "android" => {
+                    running.on_android_window_event(event_loop, window_id, &event)
+                }
+                _ => {
+                    running.on_window_event(window_id, &event)
+                }
+            })
         } else {
             Ok(EventResult::Exit)
         }
@@ -613,6 +639,10 @@ impl GlowWinitRunning<'_> {
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
             let is_visible = viewport.info.visible().unwrap_or(true);
+            // Android: a secondary window without a GL surface (not shown yet, or its Activity is
+            // in the background) cannot be painted; it is treated like a minimized window.
+            #[cfg(target_os = "android")]
+            let is_visible = is_visible && viewport.gl_surface.is_some();
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -774,12 +804,14 @@ impl GlowWinitRunning<'_> {
 
         viewport.info.events.clear(); // they should have been processed
         let window = viewport.window.clone().unwrap();
-        let gl_surface = viewport.gl_surface.as_ref().unwrap();
         let egui_winit = viewport.egui_winit.as_mut().unwrap();
 
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
         if is_visible {
+            // Only a visible viewport is painted, so only it needs its surface (on Android a
+            // surface-less window counts as invisible, see above).
+            let gl_surface = viewport.gl_surface.as_ref().unwrap();
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
             {
@@ -999,6 +1031,94 @@ impl GlowWinitRunning<'_> {
             EventResult::Wait
         }
     }
+
+    /// Android: [`Self::on_window_event`] plus the secondary-window surface lifecycle and the
+    /// embedded-viewport fallback (see `super::android_viewports`).
+    ///
+    /// The GL surface is built or released BEFORE egui sees the event: right after an
+    /// `Occluded(true)` returns, winit releases the `ANativeWindow` and acknowledges Android's
+    /// `surfaceDestroyed`, so the GL surface must be gone by then; on `Resized` a new surface must
+    /// exist so the resize applies to it. A window that just got a surface is repainted.
+    #[cfg(target_os = "android")]
+    fn on_android_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: &winit::event::WindowEvent,
+    ) -> EventResult {
+        let surface_arrived = self.update_android_surface(event_loop, window_id, event);
+        self.poll_android_embed_fallback();
+        match self.on_window_event(window_id, event) {
+            EventResult::Wait if surface_arrived => EventResult::RepaintNext(window_id),
+            other => other,
+        }
+    }
+
+    /// Android: follows a secondary window's native surface on `Resized` / `Occluded` (creates,
+    /// re-creates on a new surface generation, or releases its GL surface). The main window is
+    /// left alone (its surface follows `Resumed` / `Suspended`). Returns `true` when a new GL
+    /// surface was created. Errors are logged; the viewport then keeps running without painting.
+    #[cfg(target_os = "android")]
+    fn update_android_surface(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
+        use winit::platform::android::WindowExtAndroid as _;
+
+        if !matches!(
+            event,
+            winit::event::WindowEvent::Resized(_) | winit::event::WindowEvent::Occluded(_)
+        ) {
+            return false;
+        }
+
+        let mut glutin = self.glutin.borrow_mut();
+        let Some(viewport_id) = glutin.viewport_from_window.get(&window_id).copied() else {
+            return false;
+        };
+        let surface_state = |glutin: &GlutinWindowContext| {
+            glutin.viewports.get(&viewport_id).map(|viewport| {
+                (
+                    viewport.window.as_ref().map(|window| window.is_main_window()),
+                    viewport.gl_surface.is_some().then_some(viewport.surface_generation),
+                )
+            })
+        };
+        let Some((Some(false), built_before)) = surface_state(&glutin) else {
+            // No such viewport, no window yet, or the main window.
+            return false;
+        };
+
+        if let Err(err) = glutin.initialize_window(viewport_id, event_loop) {
+            log::error!(
+                "Failed to update the GL surface of viewport {viewport_id:?} on {event:?}: {err}"
+            );
+        }
+
+        let built_after = surface_state(&glutin).and_then(|(_, built)| built);
+        built_after.is_some() && built_after != built_before
+    }
+
+    /// Android: when the forked winit reports that a secondary window came up full-screen (the
+    /// device cannot place free-form windows), embeds every viewport for the rest of this run.
+    /// Native secondary windows still open are then dropped by the next root frame, which
+    /// finishes their Activities. Later runs start embedded (`native_windows_available` is
+    /// `false` from then on).
+    #[cfg(target_os = "android")]
+    fn poll_android_embed_fallback(&self) {
+        if winit::platform::android::multiwindow::take_embed_fallback_request() {
+            log::warn!(
+                "A secondary window came up full-screen: free-form windows are unavailable, \
+                 embedding all viewports from now on"
+            );
+            self.integration.egui_ctx.set_embed_viewports(true);
+            self.integration
+                .egui_ctx
+                .request_repaint_of(ViewportId::ROOT);
+        }
+    }
 }
 
 fn change_gl_context(
@@ -1035,6 +1155,28 @@ fn change_gl_context(
 
     profiling::scope!("make_current");
     *current_gl_context = Some(not_current.make_current(gl_surface).unwrap());
+}
+
+/// Android: drops `gl_surface`, first making the context not current when it is current on this
+/// surface (EGL defers destroying a current surface, which would keep its `ANativeWindow`
+/// connected after winit released it). The context object stays in place, not current;
+/// `change_gl_context` makes it current again on the next surface painted.
+#[cfg(target_os = "android")]
+fn release_gl_surface(
+    gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
+    current_gl_context: Option<&glutin::context::PossiblyCurrentContext>,
+    viewport_id: ViewportId,
+) {
+    if let Some(context) = current_gl_context
+        && gl_surface.is_current(context)
+        && let Err(err) = context.make_not_current_in_place()
+    {
+        log::error!(
+            "Failed to make the GL context not current before releasing the surface of viewport \
+             {viewport_id:?}: {err}"
+        );
+    }
+    drop(gl_surface);
 }
 
 impl GlutinWindowContext {
@@ -1204,6 +1346,8 @@ impl GlutinWindowContext {
                 gl_surface: None,
                 window: window.map(Arc::new),
                 egui_winit: None,
+                #[cfg(target_os = "android")]
+                surface_generation: 0,
             },
         );
 
@@ -1319,7 +1463,35 @@ impl GlutinWindowContext {
             )
         });
 
-        if viewport.gl_surface.is_none() {
+        // Android: a secondary OS window has a native surface only while its Activity shows it;
+        // follow it (see `super::android_viewports`). Everywhere else a missing surface is made.
+        #[cfg(target_os = "android")]
+        let may_create_surface = {
+            use winit::platform::android::WindowExtAndroid as _;
+
+            let action = super::android_viewports::surface_action(
+                super::android_viewports::SurfaceFacts {
+                    is_main_window: window.is_main_window(),
+                    has_native_surface: window.has_native_surface(),
+                    surface_generation: window.surface_generation(),
+                    gl_surface_generation: viewport
+                        .gl_surface
+                        .is_some()
+                        .then_some(viewport.surface_generation),
+                },
+            );
+            if action.releases()
+                && let Some(gl_surface) = viewport.gl_surface.take()
+            {
+                log::debug!("Releasing the gl_surface of viewport {viewport_id:?} ({action:?})");
+                release_gl_surface(gl_surface, self.current_gl_context.as_ref(), viewport_id);
+            }
+            action.creates()
+        };
+        #[cfg(not(target_os = "android"))]
+        let may_create_surface = true;
+
+        if may_create_surface && viewport.gl_surface.is_none() {
             log::debug!("Creating a gl_surface for viewport {viewport_id:?}");
 
             // surface attributes
@@ -1370,6 +1542,11 @@ impl GlutinWindowContext {
             // create window/surface/make context current once and just use them forever.
 
             viewport.gl_surface = Some(gl_surface);
+            #[cfg(target_os = "android")]
+            {
+                use winit::platform::android::WindowExtAndroid as _;
+                viewport.surface_generation = window.surface_generation();
+            }
 
             self.current_gl_context = Some(current_gl_context);
         }
@@ -1381,6 +1558,32 @@ impl GlutinWindowContext {
     }
 
     /// only applies for android. but we basically drop surface + window and make context not current
+    ///
+    /// Android (`ManhwaStudio` fork): `Suspended` is about the main Activity only, so only viewports
+    /// whose window is the main window (or a handle to it) lose window and surface; secondary OS
+    /// windows have their own Activity lifecycle (`Occluded`). The context is made not current
+    /// BEFORE the surfaces are dropped, so their destruction is not deferred.
+    #[cfg(target_os = "android")]
+    fn on_suspend(&mut self) -> Result {
+        use winit::platform::android::WindowExtAndroid as _;
+
+        log::debug!("received suspend event. dropping the main window and its surface");
+        self.make_context_not_current()?;
+        for viewport in self.viewports.values_mut() {
+            let on_main_window = viewport
+                .window
+                .as_ref()
+                .is_none_or(|window| window.is_main_window());
+            if on_main_window {
+                viewport.gl_surface = None;
+                viewport.window = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// only applies for android. but we basically drop surface + window and make context not current
+    #[cfg(not(target_os = "android"))]
     fn on_suspend(&mut self) -> Result {
         log::debug!("received suspend event. dropping window and surface");
         for viewport in self.viewports.values_mut() {
@@ -1394,6 +1597,48 @@ impl GlutinWindowContext {
             log::debug!("context is already not current??? could be duplicate suspend event");
         }
         Ok(())
+    }
+
+    /// Android: makes the GL context not current (no-op when it already is not).
+    ///
+    /// # Errors
+    /// The EGL error of `eglMakeCurrent`; the context is then lost (as in upstream `on_suspend`).
+    #[cfg(target_os = "android")]
+    fn make_context_not_current(&mut self) -> Result {
+        if let Some(current) = self.current_gl_context.take() {
+            log::debug!("making the GL context not current");
+            self.not_current_gl_context = Some(current.make_not_current()?);
+        } else {
+            log::debug!("the GL context is already not current");
+        }
+        Ok(())
+    }
+
+    /// Android: releases one viewport's GL surface (if any), making the context not current
+    /// first when it is current on that surface. Called on `Occluded(true)` (through
+    /// `initialize_window`) and for viewports that are going away.
+    #[cfg(target_os = "android")]
+    fn release_surface(&mut self, viewport_id: ViewportId) {
+        if let Some(gl_surface) = self
+            .viewports
+            .get_mut(&viewport_id)
+            .and_then(|viewport| viewport.gl_surface.take())
+        {
+            release_gl_surface(gl_surface, self.current_gl_context.as_ref(), viewport_id);
+        }
+    }
+
+    /// Android: before a run's state is dropped, makes the context not current and drops every
+    /// GL surface, so that no `EGLSurface` stays connected to an `ANativeWindow` that the next
+    /// `run_native` creates a surface on. Windows are dropped with the run state afterwards.
+    #[cfg(target_os = "android")]
+    fn release_surfaces_for_exit(&mut self) {
+        if let Err(err) = self.make_context_not_current() {
+            log::error!("Failed to make the GL context not current on exit: {err}");
+        }
+        for viewport in self.viewports.values_mut() {
+            viewport.gl_surface = None;
+        }
     }
 
     fn viewport(&self, viewport_id: ViewportId) -> &Viewport {
@@ -1441,6 +1686,21 @@ impl GlutinWindowContext {
         &mut self,
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
     ) {
+        // Android: a dropped secondary window finishes its Activity and releases its surface, so
+        // the GL surface must not stay current on it.
+        #[cfg(target_os = "android")]
+        {
+            let gone: Vec<ViewportId> = self
+                .viewports
+                .keys()
+                .filter(|id| !viewport_output.contains_key(id))
+                .copied()
+                .collect();
+            for viewport_id in gone {
+                self.release_surface(viewport_id);
+            }
+        }
+
         // GC old viewports
         self.viewports
             .retain(|id, _| viewport_output.contains_key(id));
@@ -1545,6 +1805,8 @@ fn initialize_or_update_viewport(
                 window: None,
                 egui_winit: None,
                 gl_surface: None,
+                #[cfg(target_os = "android")]
+                surface_generation: 0,
             })
         }
 
@@ -1695,6 +1957,20 @@ fn render_immediate_viewport(
     viewport.pending_delta.append(textures_delta);
 
     viewport.info.events.clear(); // they should have been processed
+
+    // Android: a secondary window without a native surface ran its UI but paints nothing; its
+    // platform output and nested viewports are still handled. Texture deltas wait in
+    // `pending_delta` until it can paint again.
+    #[cfg(target_os = "android")]
+    if viewport.gl_surface.is_none() {
+        if let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) {
+            egui_winit.handle_platform_output(window, platform_output);
+        }
+        event_loop_context::with_current_event_loop(|event_loop| {
+            glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
+        });
+        return;
+    }
 
     let (Some(egui_winit), Some(window), Some(gl_surface)) = (
         &mut viewport.egui_winit,

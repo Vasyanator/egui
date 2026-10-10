@@ -33,17 +33,9 @@ pub fn sleep_if_invisible_or_minimized(window: Option<&Window>) {
 pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Context {
     profiling::function_scope!();
 
-    pub const IS_DESKTOP: bool = cfg!(any(
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "openbsd",
-        target_os = "windows",
-    ));
-
     let egui_ctx = egui::Context::default();
 
-    egui_ctx.set_embed_viewports(!IS_DESKTOP);
+    egui_ctx.set_embed_viewports(!native_viewports_supported());
 
     egui_ctx.options_mut(|o| {
         // eframe supports multi-pass (Context::request_discard).
@@ -57,6 +49,30 @@ pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Contex
     egui_ctx.memory_mut(|mem| *mem = memory);
 
     egui_ctx
+}
+
+/// Whether extra viewports can be real OS windows (otherwise they are embedded in their parent).
+///
+/// Desktop platforms: always. Android (`ManhwaStudio` fork): when the forked winit can open
+/// secondary OS windows now (`multiwindow::native_windows_available`: Kotlin bridge packaged,
+/// policy and device capability allow it, no full-screen fallback happened). Evaluated for every
+/// new context, i.e. once per `run_native`, after the event loop exists (the probe needs it).
+/// Other platforms: never.
+fn native_viewports_supported() -> bool {
+    cfg_select! {
+        target_os = "android" => {
+            winit::platform::android::multiwindow::native_windows_available()
+        }
+        _ => {
+            cfg!(any(
+                target_os = "freebsd",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "openbsd",
+                target_os = "windows",
+            ))
+        }
+    }
 }
 
 /// The custom even `eframe` uses with the [`winit`] event loop.
