@@ -55,6 +55,13 @@ every window. The fork feeds the forked winit's per-window insets into egui's ex
   `viewport_rect()` (upstream used `content_rect()`, subtracting the insets twice for one frame).
 - The inset bands themselves show the clear colour; full-viewport scrims keep using
   `viewport_rect()`.
+- **egui** `TextEdit` (Android only, `cfg!(target_os = "android")`): the safe area includes the
+  soft keyboard, so opening it can clip the focused field out of the shrunken content rect.
+  Upstream requests IME output only for a VISIBLE field, which then dropped the IME, hid the
+  keyboard, restored the layout and re-enabled it: a show/hide loop every frame. The fork keeps
+  requesting IME output for a focused, editable field while it is clipped, and scrolls its cursor
+  into view when the content rect changes (`android_content_rect_changed`, temp data per field).
+  The winit fork additionally delays a hide by a grace period (`platform_impl/android/ime.rs`).
 
 ## Known gaps
 - Immediate secondary windows are painted from their parent's (root's) frame: while the main
@@ -66,6 +73,8 @@ every window. The fork feeds the forked winit's per-window insets into egui's ex
 - Surface lifecycle rule: `android_viewports.rs` (+ test), then `glow_integration.rs`
   (`initialize_window`, `update_android_surface`, `on_suspend`, `release_surfaces_for_exit`).
 - Embed decision: `winit_integration.rs::native_viewports_supported`.
+- Focused field vs. soft keyboard: `crates/egui/src/widgets/text_edit/builder.rs` (the
+  `else if cfg!(target_os = "android")` branch after `is_rect_visible`, `set_ime_output`).
 - Android safe area: `crates/egui-winit/src/lib.rs` (`set_android_safe_area`),
   `crates/egui-winit/src/safe_area.rs`, `crates/egui/src/context.rs` (`run_ui_dyn`, `begin_pass`).
 - The wgpu integration has none of this (ManhwaStudio uses glow).

@@ -872,6 +872,13 @@ impl TextEdit<'_> {
 
         let should_paint_ime_visuals_the_legacy_way = ui.visuals().ime_composition.legacy_visuals;
 
+        // ManhwaStudio fork (Android): the soft keyboard is part of the safe area, so opening it
+        // shrinks the content rect and may push the focused field out of view. Scroll its cursor
+        // back into view when that happens (see `android_content_rect_changed`).
+        let content_rect_changed = cfg!(target_os = "android")
+            && ui.memory(|mem| mem.has_focus(id))
+            && android_content_rect_changed(ui, id);
+
         if ui.is_rect_visible(inner_rect) {
             let has_focus = ui.memory(|mem| mem.has_focus(id));
 
@@ -893,7 +900,7 @@ impl TextEdit<'_> {
                 let primary_cursor_rect = cursor_rect(&galley, &cursor_range.primary, row_height)
                     .translate(galley_pos.to_vec2() - vec2(galley.rect.left(), 0.0));
 
-                if response.changed() || selection_changed {
+                if response.changed() || selection_changed || content_rect_changed {
                     // Scroll to keep primary cursor in view:
                     ui.scroll_to_rect(primary_cursor_rect, None);
                 }
@@ -944,25 +951,27 @@ impl TextEdit<'_> {
                     }
                     if ui.memory(|mem| mem.owns_ime_events(id)) {
                         // Set IME output (in screen coords) when text is editable and visible
-                        let to_global = ui
-                            .ctx()
-                            .layer_transform_to_global(ui.layer_id())
-                            .unwrap_or_default();
-                        ui.output_mut(|o| {
-                            o.ime = Some(crate::output::IMEOutput {
-                                purpose: if password {
-                                    IMEPurpose::Password
-                                } else {
-                                    IMEPurpose::Normal
-                                },
-                                rect: to_global * inner_rect,
-                                cursor_rect: to_global * primary_cursor_rect,
-                                should_interrupt_composition: false,
-                            });
-                        });
+                        set_ime_output(ui, password, inner_rect, primary_cursor_rect);
                     }
                 }
             }
+        } else if cfg!(target_os = "android")
+            && text.is_mutable()
+            && interactive
+            && ui.memory(|mem| mem.owns_ime_events(id))
+            && ui.input(|i| i.focused)
+            && let Some(cursor_range) = state.cursor.range(&galley)
+        {
+            // ManhwaStudio fork (Android): a focused field keeps the IME while it is clipped
+            // away. Upstream requests IME output only for a visible field, so a field the opened
+            // soft keyboard pushed out of the shrunken content rect dropped the IME, which hid
+            // the keyboard, which brought the field back: a show/hide loop every frame.
+            let primary_cursor_rect = cursor_rect(&galley, &cursor_range.primary, row_height)
+                .translate(galley_pos.to_vec2() - vec2(galley.rect.left(), 0.0));
+            if content_rect_changed {
+                ui.scroll_to_rect(primary_cursor_rect, None);
+            }
+            set_ime_output(ui, password, inner_rect, primary_cursor_rect);
         }
 
         state.clone().store(ui.ctx(), id);
@@ -1021,6 +1030,41 @@ impl TextEdit<'_> {
             cursor_range,
         }
     }
+}
+
+/// Requests IME output for a focused, editable `TextEdit` (`inner_rect` and `cursor_rect` in the
+/// layer's coordinates; converted to screen coordinates here).
+fn set_ime_output(ui: &Ui, password: bool, inner_rect: Rect, cursor_rect: Rect) {
+    let to_global = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .unwrap_or_default();
+    ui.output_mut(|o| {
+        o.ime = Some(crate::output::IMEOutput {
+            purpose: if password {
+                IMEPurpose::Password
+            } else {
+                IMEPurpose::Normal
+            },
+            rect: to_global * inner_rect,
+            cursor_rect: to_global * cursor_rect,
+            should_interrupt_composition: false,
+        });
+    });
+}
+
+/// `ManhwaStudio` fork (Android): whether the viewport's content rect changed since this focused
+/// `TextEdit` last looked (`false` on its first look). Stores the current rect as temp data
+/// under `id`.
+fn android_content_rect_changed(ui: &Ui, id: Id) -> bool {
+    let key = id.with("ms_android_content_rect");
+    let rect = ui.ctx().content_rect();
+    let previous = ui.data_mut(|d| {
+        let previous = d.get_temp::<Rect>(key);
+        d.insert_temp(key, rect);
+        previous
+    });
+    previous.is_some_and(|previous| previous != rect)
 }
 
 fn mask_if_password(is_password: bool, text: &str) -> String {
@@ -1453,5 +1497,38 @@ fn check_for_mutating_key_press(
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::android_content_rect_changed;
+    use crate::{Context, Id, Rect, SafeAreaInsets, epaint::MarginF32, pos2, vec2};
+
+    /// Runs one pass with `insets` and returns what `android_content_rect_changed` reports.
+    fn changed_in_pass(ctx: &Context, insets: Option<SafeAreaInsets>, id: Id) -> bool {
+        let input = crate::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            safe_area_insets: insets,
+            ..Default::default()
+        };
+        let mut changed = None;
+        let output = ctx.run_ui(input, |ui| changed = Some(android_content_rect_changed(ui, id)));
+        output.drop_without_applying_deltas();
+        changed.expect("the ui closure runs once per pass")
+    }
+
+    #[test]
+    fn content_rect_change_is_reported_once_per_change() {
+        let ctx = Context::default();
+        let id = Id::new("field");
+        let keyboard = SafeAreaInsets(MarginF32 { left: 0.0, right: 0.0, top: 0.0, bottom: 300.0 });
+        assert!(!changed_in_pass(&ctx, None, id), "first look");
+        assert!(!changed_in_pass(&ctx, None, id), "unchanged");
+        assert!(changed_in_pass(&ctx, Some(keyboard), id), "keyboard opened");
+        assert!(!changed_in_pass(&ctx, Some(keyboard), id), "keyboard stays");
+        // `None` keeps the previous insets; closing the keyboard reports zero insets.
+        let closed = SafeAreaInsets(MarginF32::ZERO);
+        assert!(changed_in_pass(&ctx, Some(closed), id), "keyboard closed");
     }
 }
