@@ -131,6 +131,11 @@ pub struct State {
     /// for details.
     #[cfg(target_os = "windows")]
     pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
+
+    /// `ManhwaStudio` fork: the window's last safe-area insets in physical pixels, so a change is
+    /// logged once.
+    #[cfg(target_os = "android")]
+    last_android_safe_area: Option<winit::platform::android::PhysicalInsets>,
 }
 
 impl State {
@@ -178,6 +183,8 @@ impl State {
             old_ime_purpose: egui::IMEPurpose::Normal,
             #[cfg(target_os = "windows")]
             pressed_processed_physical_keys: HashSet::new(),
+            #[cfg(target_os = "android")]
+            last_android_safe_area: None,
         };
 
         slf.egui_input
@@ -277,6 +284,9 @@ impl State {
             && screen_size_in_points.y > 0.0)
             .then(|| Rect::from_min_size(Pos2::ZERO, screen_size_in_points));
 
+        #[cfg(target_os = "android")]
+        self.set_android_safe_area(window);
+
         // Tell egui which viewport is now active:
         self.egui_input.viewport_id = self.viewport_id;
 
@@ -287,6 +297,38 @@ impl State {
             .native_pixels_per_point = Some(window.scale_factor() as f32);
 
         self.egui_input.take()
+    }
+
+    /// `ManhwaStudio` fork, Android: sets this frame's `safe_area_insets` from the window's insets
+    /// (system bars, display cutout, on-screen keyboard; reported per window by the forked winit
+    /// in physical pixels), converted to points at the CURRENT `pixels_per_point`, so a zoom or
+    /// density change is followed in the same frame. egui then keeps every panel inside
+    /// `content_rect` (see the fork's root-`Ui` change in `egui::Context::run_ui`).
+    #[cfg(target_os = "android")]
+    fn set_android_safe_area(&mut self, window: &Window) {
+        use winit::platform::android::WindowExtAndroid as _;
+
+        let px = window.insets().safe_area;
+        let ppp = pixels_per_point(&self.egui_ctx, window);
+        let insets =
+            safe_area::safe_area_insets_from_physical([px.left, px.top, px.right, px.bottom], ppp);
+        if self.last_android_safe_area != Some(px) {
+            self.last_android_safe_area = Some(px);
+            log::info!(
+                "egui-winit insets: viewport {:?}: safe area px l={} t={} r={} b={} -> points \
+                 l={:.1} t={:.1} r={:.1} b={:.1} (pixels_per_point {ppp})",
+                self.viewport_id,
+                px.left,
+                px.top,
+                px.right,
+                px.bottom,
+                insets.0.left,
+                insets.0.top,
+                insets.0.right,
+                insets.0.bottom,
+            );
+        }
+        self.egui_input.safe_area_insets = Some(insets);
     }
 
     /// Call this when there is a new event.

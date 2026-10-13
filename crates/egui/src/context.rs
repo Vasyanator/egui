@@ -441,7 +441,10 @@ impl ContextImpl {
 
             let input = &viewport.input;
             // This is a bit hacky, but is required to avoid jitter:
-            let mut rect = input.content_rect();
+            // `ManhwaStudio` fork: scale the VIEWPORT rect, which is what `screen_rect` means
+            // (upstream used `content_rect()`, which subtracted the safe-area insets a second time
+            // and offset the rect for one frame on every zoom change; identical without insets).
+            let mut rect = input.viewport_rect();
             rect.min = (ratio * rect.min.to_vec2()).to_pos2();
             rect.max = (ratio * rect.max.to_vec2()).to_pos2();
             new_raw_input.screen_rect = Some(rect);
@@ -804,7 +807,11 @@ impl Context {
                 Id::new((ctx.viewport_id(), "__top_ui")),
                 UiBuilder::new()
                     .layer_id(LayerId::background())
-                    .max_rect(ctx.viewport_rect()),
+                    // `ManhwaStudio` fork: the root `Ui` (and so every `Panel` / `CentralPanel`
+                    // laid out in it) stays inside the safe area; upstream used `viewport_rect()`,
+                    // so only `Area`s honoured `safe_area_insets`. Identical when the insets are
+                    // zero (`content_rect == viewport_rect`), i.e. on every desktop platform.
+                    .max_rect(ctx.content_rect()),
             );
 
             {
@@ -4524,5 +4531,38 @@ mod test {
             );
             output.drop_without_applying_deltas();
         }
+    }
+
+    /// `ManhwaStudio` fork: the root `Ui` is the safe content rect; without insets that is the
+    /// whole viewport, exactly as upstream.
+    #[test]
+    fn root_ui_is_the_content_rect() {
+        use crate::{Rect, SafeAreaInsets, epaint::MarginF32, pos2, vec2};
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let root_rect = |ctx: &Context, insets: Option<SafeAreaInsets>| {
+            let input = crate::RawInput {
+                screen_rect: Some(screen),
+                safe_area_insets: insets,
+                ..Default::default()
+            };
+            let mut rects = None;
+            let output = ctx.run_ui(input, |ui| {
+                rects = Some((ui.max_rect(), ui.ctx().content_rect(), ui.ctx().viewport_rect()));
+            });
+            output.drop_without_applying_deltas();
+            rects.unwrap()
+        };
+
+        let ctx = Context::default();
+        let (root, content, viewport) = root_rect(&ctx, None);
+        assert_eq!(content, viewport);
+        assert_eq!(root, viewport);
+
+        let insets = SafeAreaInsets(MarginF32 { left: 10.0, right: 20.0, top: 24.0, bottom: 16.0 });
+        let (root, content, viewport) = root_rect(&ctx, Some(insets));
+        assert_eq!(viewport, screen);
+        assert_eq!(content, Rect::from_min_max(pos2(10.0, 24.0), pos2(780.0, 584.0)));
+        assert_eq!(root, content);
     }
 }

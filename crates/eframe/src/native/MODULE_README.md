@@ -37,6 +37,25 @@ integration follows that model; desktop code paths are unchanged.
   and, on Android, makes the context not current and drops every surface before the run state is
   dropped, so the next `run_native` can create a surface on the same `ANativeWindow`.
 
+## Android safe area (egui-winit + egui, all platforms' code paths)
+Android draws edge-to-edge, so system bars, the display cutout and the on-screen keyboard overlap
+every window. The fork feeds the forked winit's per-window insets into egui's existing
+`RawInput::safe_area_insets` and makes egui honour them; the two changes outside eframe are marked
+"`ManhwaStudio` fork" in their comments:
+
+- **egui-winit** `State::take_egui_input` (Android only, `set_android_safe_area`): sets
+  `safe_area_insets` every frame from `WindowExtAndroid::insets().safe_area` (physical px),
+  converted to points at the current `pixels_per_point` (`safe_area.rs::
+  safe_area_insets_from_physical`, host-tested), and logs each change (`egui-winit insets:`).
+- **egui** `Context::run_ui`: the root `Ui` is `content_rect()` (viewport minus safe area) instead
+  of `viewport_rect()`, so `Panel` / `CentralPanel` stay in the safe area like `Area`s already did.
+  With zero insets the two rects are equal, so desktop layout is unchanged (test
+  `context::test::root_ui_is_the_content_rect`).
+- **egui** `ContextImpl::begin_pass`: the zoom-change `screen_rect` rescale starts from
+  `viewport_rect()` (upstream used `content_rect()`, subtracting the insets twice for one frame).
+- The inset bands themselves show the clear colour; full-viewport scrims keep using
+  `viewport_rect()`.
+
 ## Known gaps
 - Immediate secondary windows are painted from their parent's (root's) frame: while the main
   Activity has no surface (backgrounded, root window dropped) they do not repaint.
@@ -47,4 +66,6 @@ integration follows that model; desktop code paths are unchanged.
 - Surface lifecycle rule: `android_viewports.rs` (+ test), then `glow_integration.rs`
   (`initialize_window`, `update_android_surface`, `on_suspend`, `release_surfaces_for_exit`).
 - Embed decision: `winit_integration.rs::native_viewports_supported`.
+- Android safe area: `crates/egui-winit/src/lib.rs` (`set_android_safe_area`),
+  `crates/egui-winit/src/safe_area.rs`, `crates/egui/src/context.rs` (`run_ui_dyn`, `begin_pass`).
 - The wgpu integration has none of this (ManhwaStudio uses glow).
