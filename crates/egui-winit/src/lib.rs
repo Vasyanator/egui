@@ -969,7 +969,18 @@ impl State {
                     self.egui_input.events.push(egui::Event::PointerGone);
                 }
                 winit::event::TouchPhase::Cancelled => {
+                    // ManhwaStudio fork: release the simulated primary button the
+                    // `Started` arm pressed. Without it egui keeps `Primary` down
+                    // (and the pressed widget dragged) until the next touch or click;
+                    // platforms cancel touches routinely (Android palm rejection, a
+                    // system gesture taking over). egui has no "cancel" pointer
+                    // event, so this is an ordinary release: a cancelled touch that
+                    // was short and stationary still counts as a click.
                     self.pointer_touch_id = None;
+                    self.on_mouse_button_input(
+                        winit::event::ElementState::Released,
+                        winit::event::MouseButton::Left,
+                    );
                     self.pointer_pos_in_points = None;
                     self.egui_input.events.push(egui::Event::PointerGone);
                 }
